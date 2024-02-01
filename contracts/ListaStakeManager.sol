@@ -8,23 +8,24 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 
-import {IStakeManager} from "./interfaces/IStakeManager.sol";
-import {ISnBnb} from "./interfaces/ISnBnb.sol";
+import {IListaStakeManager} from "./interfaces/IListaStakeManager.sol";
+import {ISLisBNB} from "./interfaces/ISLisBNB.sol";
+import {ILisBNB} from "./interfaces/ILisBNB.sol";
 import {IStaking} from "./interfaces/INativeStaking.sol";
 
 /**
  * @title Stake Manager Contract
  * @dev Handles Staking of BNB on BSC
  */
-contract SnStakeManager is
-    IStakeManager,
+contract ListaStakeManager is
+    IListaStakeManager,
     Initializable,
     PausableUpgradeable,
     AccessControlUpgradeable
 {
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
-    uint256 public totalSnBnbToBurn;
+    uint256 public totalSLisBNBToBurn;
 
     uint256 public totalDelegated; // total BNB delegated
     uint256 public amountToDelegate; // total BNB to delegate for next batch
@@ -35,7 +36,7 @@ contract SnStakeManager is
     uint256 public reserveAmount; // will be used to adjust minThreshold delegate/undelegate for natvie staking
     uint256 public totalReserveAmount;
 
-    address private snBnb;
+    address private slisBnb;
     address private bcValidator;
 
     mapping(uint256 => BotUndelegateRequest)
@@ -52,6 +53,9 @@ contract SnStakeManager is
     address public revenuePool;
     address public redirectAddress;
 
+    address private lisBnb; // 1 LisBNB equals 1 BNB
+    uint256 public totalLisBNBToBurn;
+
     address private constant NATIVE_STAKING = 0x0000000000000000000000000000000000002001;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -60,7 +64,7 @@ contract SnStakeManager is
     }
 
     /**
-     * @param _snBnb - Address of SnBnb Token on Binance Smart Chain
+     * @param _slisBnb - Address of SLisBnb Token on Binance Smart Chain
      * @param _admin - Address of the admin
      * @param _manager - Address of the manager
      * @param _bot - Address of the Bot
@@ -69,7 +73,8 @@ contract SnStakeManager is
      * @param _validator - Validator to delegate BNB
      */
     function initialize(
-        address _snBnb,
+        address _slisBnb,
+        address _lisBnb,
         address _admin,
         address _manager,
         address _bot,
@@ -81,7 +86,8 @@ contract SnStakeManager is
         __Pausable_init();
 
         require(
-            ((_snBnb != address(0)) &&
+            ((_slisBnb != address(0)) &&
+                (_lisBnb != address(0)) &&
                 (_admin != address(0)) &&
                 (_manager != address(0)) &&
                 (_validator != address(0)) &&
@@ -96,7 +102,8 @@ contract SnStakeManager is
         _setupRole(BOT, _bot);
 
         manager = _manager;
-        snBnb = _snBnb;
+        slisBnb = _slisBnb;
+        lisBnb = _lisBnb;
         bcValidator = _validator;
         synFee = _synFee;
         revenuePool = _revenuePool;
@@ -105,22 +112,65 @@ contract SnStakeManager is
         emit SetBCValidator(bcValidator);
         emit SetRevenuePool(revenuePool);
         emit SetSynFee(_synFee);
+        emit SetLisBNB(lisBnb);
     }
 
     /**
-     * @dev Allows user to deposit Bnb at BSC and mints SnBnb for the user
+     * @dev Allows user to deposit BNB and mint SlisBNB for the user
      */
     function deposit() external payable override whenNotPaused {
         uint256 amount = msg.value;
         require(amount > 0, "Invalid Amount");
 
-        uint256 snBnbToMint = convertBnbToSnBnb(amount);
+        uint256 snBnbToMint = convertBnbToSlisBnb(amount);
         require(snBnbToMint > 0, "Invalid SnBnb Amount");
         amountToDelegate += amount;
 
-        ISnBnb(snBnb).mint(msg.sender, snBnbToMint);
+        ISLisBNB(slisBnb).mint(msg.sender, snBnbToMint);
 
         emit Deposit(msg.sender, msg.value);
+    }
+
+    /**
+     * @dev Allows user to deposit BNB and mint LisBNB for the user
+     */
+    function depositV2() external payable override whenNotPaused {
+        uint256 amount = msg.value;
+        require(amount > 0, "Invalid Amount");
+
+        amountToDelegate += amount;
+
+        ILisBNB(lisBnb).mint(msg.sender, amount);
+
+        emit DepositV2(msg.sender, msg.value);
+    }
+
+    /**
+     * @dev Allows user to stake LisBNB and mint SlisBNB for the user
+     */
+    function stake(uint256 amount) external override whenNotPaused {
+        require(amount > 0, "Invalid Amount");
+
+        uint256 slisBnbToMint = convertToShares(amount);
+        require(slisBnbToMint > 0, "Invalid SnBnb Amount");
+
+        ILisBNB(lisBnb).burn(msg.sender, amount);
+        ISLisBNB(slisBnb).mint(msg.sender, slisBnbToMint);
+
+        emit Stake(msg.sender, amount);
+    }
+
+    /**
+     * @dev Allows user to unstake SlisBNB and mint LisBNB for the user
+     */
+    function unstake(uint256 amount) external override whenNotPaused {
+        require(amount > 0, "Invalid Amount");
+
+        uint256 lisBnbToMint = convertToAssets(amount);
+        require(lisBnbToMint > 0, "Invalid SnBnb Amount");
+
+        ISLisBNB(slisBnb).burn(msg.sender, amount);
+        ILisBNB(lisBnb).mint(msg.sender, lisBnbToMint);
     }
 
     /**
@@ -231,19 +281,19 @@ contract SnStakeManager is
     }
 
     /**
-     * @dev Allows user to request for unstake/withdraw funds
-     * @param _amountInSnBnb - Amount of SnBnb to swap for withdraw
-     * @notice User must have approved this contract to spend SnBnb
+     * @dev Allows user to request for unstake/withdraw slisBNB
+     * @param _amountInSlisBnb - Amount of slisBNB to swap for withdraw
+     * @notice User must have approved this contract to spend slisBNB
      */
-    function requestWithdraw(uint256 _amountInSnBnb)
+    function requestWithdraw(uint256 _amountInSlisBnb)
         external
         override
         whenNotPaused
     {
-        require(_amountInSnBnb > 0, "Invalid Amount");
+        require(_amountInSlisBnb > 0, "Invalid Amount");
 
-        totalSnBnbToBurn += _amountInSnBnb;
-        uint256 totalBnbToWithdraw = convertSnBnbToBnb(totalSnBnbToBurn);
+        totalSLisBNBToBurn += _amountInSlisBnb;
+        uint256 totalBnbToWithdraw = convertSlisBnbToBnb(totalSLisBNBToBurn);
         require(
             totalBnbToWithdraw <= totalDelegated + amountToDelegate,
             "Not enough BNB to withdraw"
@@ -251,18 +301,54 @@ contract SnStakeManager is
 
         userWithdrawalRequests[msg.sender].push(
             WithdrawalRequest({
+                tokenType: RequestTokenType.SLISBNB,
                 uuid: nextUndelegateUUID,
-                amountInSnBnb: _amountInSnBnb,
+                amountInBnbX: _amountInSlisBnb,
                 startTime: block.timestamp
             })
         );
 
-        IERC20Upgradeable(snBnb).safeTransferFrom(
+        IERC20Upgradeable(slisBnb).safeTransferFrom(
             msg.sender,
             address(this),
-            _amountInSnBnb
+            _amountInSlisBnb
         );
-        emit RequestWithdraw(msg.sender, _amountInSnBnb);
+        emit RequestWithdraw(msg.sender, _amountInSlisBnb);
+    }
+
+    /**
+     * @dev Allows user to request for unstake/withdraw lisBNB
+     */
+    function requestWithdrawV2(uint256 _amountInLisBNB)
+        external
+        override
+        whenNotPaused
+    {
+        require(_amountInLisBNB > 0, "Invalid Amount");
+
+        totalLisBNBToBurn += _amountInLisBNB;
+        uint256 totalBnbToWithdraw = totalLisBNBToBurn; // 1 LisBNB == 1 BNB
+        require(
+            totalBnbToWithdraw <= totalDelegated + amountToDelegate,
+            "Not enough BNB to withdraw"
+        );
+
+        userWithdrawalRequests[msg.sender].push(
+            WithdrawalRequest({
+                tokenType: RequestTokenType.LISBNB,
+                uuid: nextUndelegateUUID,
+                amountInBnbX: _amountInLisBNB, // FIXME: this is not SnBnb
+                startTime: block.timestamp
+            })
+        );
+
+        IERC20Upgradeable(lisBnb).safeTransferFrom(
+            msg.sender,
+            address(this),
+            _amountInLisBNB
+        );
+
+        emit RequestWithdrawV2(msg.sender, _amountInLisBNB);
     }
 
     function claimWithdraw(uint256 _idx) external override whenNotPaused {
@@ -272,8 +358,9 @@ contract SnStakeManager is
         require(_idx < userRequests.length, "Invalid index");
 
         WithdrawalRequest storage withdrawRequest = userRequests[_idx];
+        RequestTokenType tokenType = withdrawRequest.tokenType;
         uint256 uuid = withdrawRequest.uuid;
-        uint256 amountInSnBnb = withdrawRequest.amountInSnBnb;
+        uint256 amountInBnbX = withdrawRequest.amountInBnbX;
 
         BotUndelegateRequest
             storage botUndelegateRequest = uuidToBotUndelegateRequestMap[uuid];
@@ -282,9 +369,10 @@ contract SnStakeManager is
         userRequests.pop();
 
         uint256 totalBnbToWithdraw_ = botUndelegateRequest.amount;
-        uint256 totalSnBnbToBurn_ = botUndelegateRequest.amountInSnBnb;
-        uint256 amount = (totalBnbToWithdraw_ * amountInSnBnb) /
-            totalSnBnbToBurn_;
+        uint256 totalSlisBnbToBurn_ = botUndelegateRequest.amountInSLisBNB;
+        uint256 amount = tokenType == RequestTokenType.LISBNB
+            ? amountInBnbX : (totalBnbToWithdraw_ * amountInBnbX) /
+            totalSlisBnbToBurn_;
 
         AddressUpgradeable.sendValue(payable(user), amount);
 
@@ -310,8 +398,10 @@ contract SnStakeManager is
         require(relayFeeReceived == relayFee, "Insufficient RelayFee");
 
         _uuid = nextUndelegateUUID++; // post-increment : assigns the current value first and then increments
-        uint256 totalSnBnbToBurn_ = totalSnBnbToBurn; // To avoid Reentrancy attack
-        _amount = convertSnBnbToBnb(totalSnBnbToBurn_);
+        uint256 totalSnBnbToBurn_ = totalSLisBNBToBurn; // To avoid Reentrancy attack
+        uint256 totalLisBNBToBurn_ = totalLisBNBToBurn; // To avoid Reentrancy attack
+
+        _amount = convertSlisBnbToBnb(totalSnBnbToBurn_) + totalLisBNBToBurn_;
         _amount -= _amount % TEN_DECIMALS;
 
         require(
@@ -323,13 +413,16 @@ contract SnStakeManager is
             startTime: block.timestamp,
             endTime: 0,
             amount: _amount,
-            amountInSnBnb: totalSnBnbToBurn_
+            amountInSLisBNB: totalSnBnbToBurn_,
+            amountInLisBNB: totalLisBNBToBurn_
         });
 
         totalDelegated -= _amount;
-        totalSnBnbToBurn = 0;
+        totalSLisBNBToBurn = 0;
+        totalLisBNBToBurn = 0;
 
-        ISnBnb(snBnb).burn(address(this), totalSnBnbToBurn_);
+        ISLisBNB(slisBnb).burn(address(this), totalSnBnbToBurn_);
+        ILisBNB(lisBnb).burn(address(this), totalLisBNBToBurn_);
 
         // undelegate through native staking contract
         IStaking(NATIVE_STAKING).undelegate{value: msg.value}(bcValidator, _amount + reserveAmount);
@@ -487,6 +580,15 @@ contract SnStakeManager is
         emit SetRevenuePool(_address);
     }
 
+    function setLisBNB(address _lisBnb) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(lisBnb != _lisBnb, "Old address == new address");
+        require(_lisBnb != address(0), "zero address provided");
+
+        lisBnb = _lisBnb;
+
+        emit SetLisBNB(lisBnb);
+    }
+
     function getTotalPooledBnb() public view override returns (uint256) {
         return (amountToDelegate + totalDelegated);
     }
@@ -502,7 +604,7 @@ contract SnStakeManager is
         )
     {
         _manager = manager;
-        _snBnb = snBnb;
+        _snBnb = slisBnb;
         _bcValidator = bcValidator;
     }
 
@@ -551,8 +653,9 @@ contract SnStakeManager is
         require(_idx < userRequests.length, "Invalid index");
 
         WithdrawalRequest storage withdrawRequest = userRequests[_idx];
+        RequestTokenType tokenType = withdrawRequest.tokenType;
         uint256 uuid = withdrawRequest.uuid;
-        uint256 amountInSnBnb = withdrawRequest.amountInSnBnb;
+        uint256 amountInBnbX = withdrawRequest.amountInBnbX;
 
         BotUndelegateRequest
             storage botUndelegateRequest = uuidToBotUndelegateRequestMap[uuid];
@@ -560,25 +663,26 @@ contract SnStakeManager is
         // bot has triggered startUndelegation
         if (botUndelegateRequest.amount > 0) {
             uint256 totalBnbToWithdraw_ = botUndelegateRequest.amount;
-            uint256 totalSnBnbToBurn_ = botUndelegateRequest.amountInSnBnb;
-            _amount = (totalBnbToWithdraw_ * amountInSnBnb) / totalSnBnbToBurn_;
+            uint256 totalSlisBnbToBurn_ = botUndelegateRequest.amountInSLisBNB;
+            _amount = (totalBnbToWithdraw_ * amountInBnbX) / totalSlisBnbToBurn_;
         }
         // bot has not triggered startUndelegation yet
         else {
-            _amount = convertSnBnbToBnb(amountInSnBnb);
+            _amount = tokenType == RequestTokenType.LISBNB ? amountInBnbX : convertSlisBnbToBnb(amountInBnbX);
         }
         _isClaimable = (botUndelegateRequest.endTime != 0);
     }
 
-    function getSnBnbWithdrawLimit()
+    function getSlisBnbWithdrawLimit()
         external
         view
         override
         returns (uint256 _snBnbWithdrawLimit)
     {
         _snBnbWithdrawLimit =
-            convertBnbToSnBnb(totalDelegated) -
-            totalSnBnbToBurn;
+            convertBnbToSlisBnb(totalDelegated) -
+            totalLisBNBToBurn -
+            totalSLisBNBToBurn;
     }
 
     /**
@@ -591,13 +695,13 @@ contract SnStakeManager is
     /**
      * @dev Calculates amount of SnBnb for `_amount` Bnb
      */
-    function convertBnbToSnBnb(uint256 _amount)
+    function convertBnbToSlisBnb(uint256 _amount)
         public
         view
         override
         returns (uint256)
     {
-        uint256 totalShares = ISnBnb(snBnb).totalSupply();
+        uint256 totalShares = ISLisBNB(slisBnb).totalSupply();
         totalShares = totalShares == 0 ? 1 : totalShares;
 
         uint256 totalPooledBnb = getTotalPooledBnb();
@@ -609,23 +713,53 @@ contract SnStakeManager is
     }
 
     /**
-     * @dev Calculates amount of Bnb for `_amountInSnBnb` SnBnb
+     * @dev Calculates amount of Bnb for `_amountInSlisBnb` SnBnb
      */
-    function convertSnBnbToBnb(uint256 _amountInSnBnb)
+    function convertSlisBnbToBnb(uint256 _amountInSlisBnb)
         public
         view
         override
         returns (uint256)
     {
-        uint256 totalShares = ISnBnb(snBnb).totalSupply();
+        uint256 totalShares = ISLisBNB(slisBnb).totalSupply();
         totalShares = totalShares == 0 ? 1 : totalShares;
 
         uint256 totalPooledBnb = getTotalPooledBnb();
         totalPooledBnb = totalPooledBnb == 0 ? 1 : totalPooledBnb;
 
-        uint256 amountInBnb = (_amountInSnBnb * totalPooledBnb) / totalShares;
+        uint256 amountInBnb = (_amountInSlisBnb * totalPooledBnb) / totalShares;
 
         return amountInBnb;
+    }
+
+    /**
+        @dev Calculates amount of SlisBNB for `_amount` lisBNB
+     */
+    function convertToShares(uint256 amount) public view override returns (uint256) {
+        uint256 totalShares = ISLisBNB(slisBnb).totalSupply();
+        totalShares = totalShares == 0 ? 1 : totalShares;
+
+        uint256 totalAssets = ILisBNB(lisBnb).totalSupply();
+        totalAssets = totalAssets == 0 ? 1 : totalAssets;
+
+        uint256 slisBnbAmount = (amount * totalShares) / totalAssets;
+
+        return slisBnbAmount;
+    }
+
+    /**
+        @dev Calculates amount of LisBNB for `_amount` lisBNB
+     */
+    function convertToAssets(uint256 amount) public view override returns (uint256) {
+        uint256 totalShares = ISLisBNB(slisBnb).totalSupply();
+        totalShares = totalShares == 0 ? 1 : totalShares;
+
+        uint256 totalAssets = ILisBNB(lisBnb).totalSupply();
+        totalAssets = totalAssets == 0 ? 1 : totalAssets;
+
+        uint256 slisBnbAmount = (amount * totalAssets) / totalShares;
+
+        return slisBnbAmount;
     }
 
     /**

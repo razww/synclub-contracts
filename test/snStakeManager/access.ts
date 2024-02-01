@@ -21,7 +21,7 @@ describe("SnStakeManager::access", function () {
     this.addrs = addrs;
     this.deployer = deployer;
     const { deployMockContract } = await loadFixture(deployFixture);
-    mockSnBNB = await deployMockContract("SnBnb");
+    mockSnBNB = await deployMockContract("SLisBNB");
     admin = this.addrs[1];
     manager = this.addrs[2];
     bot = this.addrs[3];

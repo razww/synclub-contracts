@@ -1,23 +1,27 @@
 //SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.0;
 
-interface IStakeManager {
+interface IListaStakeManager {
+    enum RequestTokenType {SLISBNB, LISBNB}
 
     struct BotUndelegateRequest {
         uint256 startTime;
         uint256 endTime;
         uint256 amount;
-        uint256 amountInSnBnb;
+        uint256 amountInSLisBNB;
+        uint256 amountInLisBNB;
     }
 
     struct WithdrawalRequest {
+        RequestTokenType tokenType;
         uint256 uuid;
-        uint256 amountInSnBnb;
+        uint256 amountInBnbX;
         uint256 startTime;
     }
 
     function initialize(
         address _snBnb,
+        address _lisBNB,
         address _admin,
         address _manager,
         address _bot,
@@ -27,6 +31,12 @@ interface IStakeManager {
     ) external;
 
     function deposit() external payable;
+
+    function depositV2() external payable;
+
+    function stake(uint256 _amount) external;
+
+    function unstake(uint256 _amount) external;
 
     function delegate()
         external
@@ -43,7 +53,9 @@ interface IStakeManager {
         payable
         returns (uint256 _amount);
 
-    function requestWithdraw(uint256 _amountInSnBnb) external;
+    function requestWithdraw(uint256 _amountInSLisBNB) external;
+
+    function requestWithdrawV2(uint256 _amountInLisBNB) external;
 
     function claimWithdraw(uint256 _idx) external;
 
@@ -80,6 +92,8 @@ interface IStakeManager {
 
     function setRedirectAddress(address _address) external;
 
+    function setLisBNB(address _address) external;
+
     function getTotalPooledBnb() external view returns (uint256);
 
     function getContracts()
@@ -106,24 +120,30 @@ interface IStakeManager {
         view
         returns (bool _isClaimable, uint256 _amount);
 
-    function getSnBnbWithdrawLimit()
+    function getSlisBnbWithdrawLimit()
         external
         view
         returns (uint256 _bnbXWithdrawLimit);
 
     function getTokenHubRelayFee() external view returns (uint256);
 
-    function convertBnbToSnBnb(uint256 _amount) external view returns (uint256);
+    function convertBnbToSlisBnb(uint256 _amount) external view returns (uint256);
 
-    function convertSnBnbToBnb(uint256 _amountInBnbX)
+    function convertSlisBnbToBnb(uint256 _amountInBnbX)
         external
         view
         returns (uint256);
 
+    function convertToShares(uint256 _amount) external view returns (uint256);
+    function convertToAssets(uint256 _amount) external view returns (uint256);
+
     event Deposit(address _src, uint256 _amount);
+    event DepositV2(address _src, uint256 _amount);
+    event Stake(address _src, uint256 _amount);
     event Delegate(uint256 _amount);
     event ReDelegate(address _src, address _dest, uint256 _amount);
-    event RequestWithdraw(address indexed _account, uint256 _amountInBnbX);
+    event RequestWithdraw(address indexed _account, uint256 _amountInSLisBNB);
+    event RequestWithdrawV2(address indexed _account, uint256 _amountInLisBNB);
     event ClaimWithdrawal(
         address indexed _account,
         uint256 _idx,
@@ -137,6 +157,7 @@ interface IStakeManager {
     event SetRedirectAddress(address indexed _address);
     event SetBCValidator(address indexed _address);
     event SetRevenuePool(address indexed _address);
+    event SetLisBNB(address indexed _address);
     event RewardsCompounded(uint256 _amount);
     event DelegateReserve(uint256 _amount);
     event UndelegateReserve(uint256 _amount);
