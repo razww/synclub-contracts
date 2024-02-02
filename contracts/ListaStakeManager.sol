@@ -65,6 +65,7 @@ contract ListaStakeManager is
 
     /**
      * @param _slisBnb - Address of SLisBnb Token on Binance Smart Chain
+    * @param _lisBnb - Address of LisBnb Token on Binance Smart Chain
      * @param _admin - Address of the admin
      * @param _manager - Address of the manager
      * @param _bot - Address of the Bot
