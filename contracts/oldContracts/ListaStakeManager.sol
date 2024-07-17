@@ -8,15 +8,14 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 
-import {IStakeManager} from "./interfaces/IStakeManager.sol";
-import {ISLisBNB} from "./interfaces/ISLisBNB.sol";
-import {IStakeHub} from "./interfaces/IStakeHub.sol";
-import {IStakeCredit} from "./interfaces/IStakeCredit.sol";
+import {IStakeManager} from "./interfaces/IListaStakeManager.sol";
+import {ISLisBNB} from "../interfaces/ISLisBNB.sol";
+import {IStakeHub} from "../interfaces/IStakeHub.sol";
+import {IStakeCredit} from "../interfaces/IStakeCredit.sol";
 
 /**
  * @title Stake Manager Contract
- * @author Lista
- * @notice This contract handles the liquid staking of BNB on BSC through the native StakeHub contract
+ * @dev Handles Staking of BNB on BSC
  */
 contract ListaStakeManager is
     IStakeManager,
@@ -26,37 +25,22 @@ contract ListaStakeManager is
 {
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
-    // Deprecated variable; always zero
-    uint256 public totalSnBnbToBurn;
+    uint256 public totalSnBnbToBurn; // received User withdraw requests; no use in new logic
 
-    // Total delegations including unbonding BNB
-    uint256 public totalDelegated;
+    uint256 public totalDelegated; // delegated + unbonding
+    uint256 public amountToDelegate; // total BNB to delegate for next batch
 
-    // Total available BNB for the next delegation
-    uint256 public amountToDelegate;
+    uint256 public requestUUID; // global UUID for each user withdrawal request
+    uint256 public nextConfirmedRequestUUID; // req whose uuid < nextConfirmedRequestUUID is claimable
 
-    // Global UUID for each withdrawal request
-    uint256 public requestUUID;
-
-    // UUID for the next confirmed request; req whose uuid < nextConfirmedRequestUUID is claimable
-    uint256 public nextConfirmedRequestUUID;
-
-    // Buffer amount for undelegation
-    uint256 public reserveAmount;
-
-    // Reserved BNB amount from redirect address
+    uint256 public reserveAmount; // buffer amount for undelegation
     uint256 public totalReserveAmount;
 
-    // Address of SlisBnb Token
     address private slisBnb;
+    address private bscValidator; // the initial BSC validator funds will be migrated to
 
-    // Deprecated variable; the initial BSC validator funds will be migrated to
-    address private bscValidator;
-
-    // Deprecated variable
-    mapping(uint256 => BotUndelegateRequest) private uuidToBotUndelegateRequestMap;
-
-    // User's address => WithdrawalRequest[]
+    mapping(uint256 => BotUndelegateRequest)
+        private uuidToBotUndelegateRequestMap; // no use in new logic
     mapping(address => WithdrawalRequest[]) private userWithdrawalRequests;
 
     uint256 public constant TEN_DECIMALS = 1e10;
@@ -71,35 +55,17 @@ contract ListaStakeManager is
 
     address private constant STAKE_HUB = 0x0000000000000000000000000000000000002002;
 
-    // Validators are whitelisted or not
-    // The operator address of the validator => true/false
     mapping(address => bool) public validators;
+    bool public delegateVotePower; // delegate voting power to validator or not
 
-    // Whether to delegate voting power to validator or not
-    bool public delegateVotePower;
+    uint256 public undelegatedQuota; // the amount Bnb received but not claimable yet
+    UserRequest[] internal withdrawalQueue; // queue for requested withdrawals
 
-    // The amount Bnb received but not claimable yet
-    uint256 public undelegatedQuota;
-
-    // The queue for requested withdrawals
-    UserRequest[] internal withdrawalQueue;
-
-    // The mapping used to find the index in withdrawalQueue by uuid
-    // uuid => index in withdrawalQueue
-    mapping(uint256 => uint256) public requestIndexMap;
-
-    // Address of the credit contracts
+    mapping(uint256 => uint256) public requestIndexMap; // uuid => index in withdrawalQueue
     address[] public creditContracts;
-
-    // States of credit contracts; use mapping to reduce gas of `receive()`
-    // credit contract address => true/false
-    mapping(address => bool) public creditStates;
-
-    // The amount of BNB unbonding in fly; precise bnb amount
-    uint256 public unbondingBnb;
-
-    // The minimum amount of BNB required to withdraw
-    uint256 public minBnb;
+    mapping(address => bool) public creditStates; // states of credit contracts; use mapping to reduce gas of `receive()`
+    uint256 public unbondingBnb; // the amount of BNB unbonding in fly; precise bnb amount
+    uint256 public minBnb; // the minimum amount of BNB to withdraw; initial value is 0.01 BNB
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -211,6 +177,7 @@ contract ListaStakeManager is
 
         uint256 shares = convertBnbToShares(srcValidator, _amount);
 
+
         // redelegate through native staking contract
         IStakeHub(STAKE_HUB).redelegate(srcValidator, dstValidator, shares, delegateVotePower);
 
@@ -218,7 +185,7 @@ contract ListaStakeManager is
     }
 
     /**
-     * @dev Allow users to request to unstake BNB.
+     * @dev Allow users to request for unstake/withdraw funds
      * @param _amountInSlisBnb - Amount of SlisBnb to swap for withdraw
      * @notice User must have approved this contract to spend SlisBnb
      */
@@ -227,21 +194,17 @@ contract ListaStakeManager is
         override
         whenNotPaused
     {
-        require(_amountInSlisBnb > 0, "Invalid slisBnb Amount");
+        require(_amountInSlisBnb > 0, "Invalid Amount");
 
         uint256 bnbToWithdraw = convertSnBnbToBnb(_amountInSlisBnb);
         require(bnbToWithdraw > minBnb, "Bnb amount is too small to withdraw");
 
-        // TODO: use withdrawalQueue[length-1]
-        uint256 totalAmount = bnbToWithdraw + withdrawalQueue[requestIndexMap[requestUUID]].totalAmount;
-        uint256 totalAmountInSlisBnb = _amountInSlisBnb + withdrawalQueue[requestIndexMap[requestUUID]].totalAmountInSlisBnb;
-
-        /*
+        uint256 totalAmount = bnbToWithdraw;
+        uint256 totalAmountInSlisBnb = _amountInSlisBnb;
         if (withdrawalQueue.length != 0) {
             totalAmount += withdrawalQueue[requestIndexMap[requestUUID]].totalAmount;
             totalAmountInSlisBnb += withdrawalQueue[requestIndexMap[requestUUID]].totalAmountInSlisBnb;
         }
-        */
 
         requestUUID++;
         userWithdrawalRequests[msg.sender].push(
@@ -273,7 +236,7 @@ contract ListaStakeManager is
 
     /**
      * @dev Users use this function to claim the requested withdrawals
-     * @param _idx - The index of the request in the array returns by getUserWithdrawalRequests()
+     * @param _idx - index of the request in the array returns by getUserWithdrawalRequests()
      */
     function claimWithdraw(uint256 _idx) external override whenNotPaused {
         address user = msg.sender;
@@ -283,23 +246,74 @@ contract ListaStakeManager is
 
         WithdrawalRequest storage withdrawRequest = userRequests[_idx];
         uint256 uuid = withdrawRequest.uuid;
-        UserRequest storage request = withdrawalQueue[requestIndexMap[uuid]];
+        uint256 amount;
 
-        require(uuid < nextConfirmedRequestUUID, "Not able to claim yet");
+        // 1. queue.length == 0 => old logic
+        // 2. queue.length > 0 && uuid < queue[0].uuid => old logic
+        // 3. queue.length > 0 && uuid >= queue[0].uuid => new logic
+
+        if (withdrawalQueue.length != 0 && uuid >= withdrawalQueue[0].uuid) {
+            // new logic
+            UserRequest storage request = withdrawalQueue[requestIndexMap[uuid]];
+            require(uuid < nextConfirmedRequestUUID, "Not able to claim yet");
+            amount = request.amount;
+        } else {
+            // old logic
+            uint256 amountInSlisBnb = withdrawRequest.amountInSnBnb;
+            BotUndelegateRequest
+                storage botUndelegateRequest = uuidToBotUndelegateRequestMap[uuid];
+            require(botUndelegateRequest.endTime != 0, "Not able to claim yet");
+            uint256 totalBnbToWithdraw_ = botUndelegateRequest.amount;
+            uint256 totalSlisBnbToBurn_ = botUndelegateRequest.amountInSnBnb;
+            amount = (totalBnbToWithdraw_ * amountInSlisBnb) /
+            totalSlisBnbToBurn_;
+        }
 
         userRequests[_idx] = userRequests[userRequests.length - 1];
         userRequests.pop();
 
-        AddressUpgradeable.sendValue(payable(user), request.amount);
+        AddressUpgradeable.sendValue(payable(user), amount);
 
-        emit ClaimWithdrawal(user, _idx, request.amount);
+        emit ClaimWithdrawal(user, _idx, amount);
     }
 
+
     /**
-     * @dev Deprecated after fusion
+     * @dev Undelegate the BNB amount equivalent to totalSnBnbToBurn from the bscValidator.
+     *      This method is used to process the withdrawal requests happened before 2nd upgrade(multi-validator upgrade);
+     *      This method should be called only once before calling undelegateFrom after 2nd upgrade.
+     * @return _uuid - unique id against which this Undelegation event was logged
+     * @return _amount - the actual amount of BNB to be undelegated
      */
-    function undelegate() external override whenNotPaused onlyRole(BOT) returns (uint256 _uuid, uint256 _amount) {
-        revert("not supported");
+    function undelegate()
+        external
+        override
+        whenNotPaused
+        onlyRole(BOT)
+        returns (uint256 _uuid, uint256 _amount)
+    {
+        require(totalSnBnbToBurn > 0, "Nothing to undelegate");
+        _uuid = withdrawalQueue.length != 0 ? withdrawalQueue[0].uuid - 1: requestUUID;
+        // Pin _uuid to the last `nextUndelegateUUID` in old version
+
+        uint256 totalSlisBnbToBurn_ = totalSnBnbToBurn; // To avoid Reentrancy attack
+        uint256 bnbAmount_ = convertSnBnbToBnb(totalSlisBnbToBurn_);
+        uint256 shares_ = convertBnbToShares(bscValidator, bnbAmount_ + reserveAmount);
+
+        uuidToBotUndelegateRequestMap[_uuid] = BotUndelegateRequest({
+            startTime: block.timestamp,
+            endTime: 0,
+            amount: bnbAmount_,
+            amountInSnBnb: totalSlisBnbToBurn_
+        });
+
+        totalSnBnbToBurn = 0;
+        _amount = convertSharesToBnb(bscValidator, shares_);
+        unbondingBnb += _amount;
+
+        IStakeHub(STAKE_HUB).undelegate(bscValidator, shares_);
+
+        emit Undelegate(_uuid, bnbAmount_, shares_);
     }
 
     /**
@@ -307,6 +321,7 @@ contract ListaStakeManager is
      * @param _operator - Operator address of validator to undelegate from
      * @param _amount - Amount of bnb to undelegate
      * @return _actualBnbAmount - the actual amount of BNB to be undelegated
+     * @notice Bot should invoke `undelegate()` first to process old requests before calling this function
      */
     function undelegateFrom(address _operator, uint256 _amount)
         external
@@ -327,10 +342,11 @@ contract ListaStakeManager is
     }
 
     /**
-     * @dev Bot uses this function to claim unbonded BNB and rewards from a validator
+     * @dev Claim unbonded BNB and rewards from the validator
      * @param _validator - The operator address of the validator
      * @return _uuid - the next confirmed request uuid
      * @return _amount - the amount of BNB claimed, staking rewards included
+     * @notice Old requests should be undelegated first via calling `undelegate()`
      */
     function claimUndelegated(address _validator)
         external
@@ -351,8 +367,28 @@ contract ListaStakeManager is
 
         uint256 coveredAmount = 0;
         uint256 coveredSlisBnbAmount = 0;
+        uint256 oldLastUUID = withdrawalQueue.length != 0 ? withdrawalQueue[0].uuid - 1 : requestUUID;
 
-        if (withdrawalQueue.length != 0 && withdrawalQueue[0].uuid <= nextConfirmedRequestUUID) {
+        // old requests will be fully covered by the last undelegated() call, can be removed in next version
+        for (uint256 i = nextConfirmedRequestUUID; i <= oldLastUUID; ++i) {
+            BotUndelegateRequest storage botRequest = uuidToBotUndelegateRequestMap[i];
+            if (undelegatedQuota < botRequest.amount) {
+                totalDelegated -= coveredAmount;
+                if (coveredSlisBnbAmount > 0) {
+                    ISLisBNB(slisBnb).burn(address(this), coveredSlisBnbAmount);
+                }
+                emit ClaimUndelegatedFrom(_validator, nextConfirmedRequestUUID, undelegatedAmount);
+                return (nextConfirmedRequestUUID, undelegatedAmount);
+            }
+            botRequest.endTime = block.timestamp;
+            undelegatedQuota -= botRequest.amount;
+            coveredAmount += botRequest.amount;
+            coveredSlisBnbAmount += botRequest.amountInSnBnb;
+            ++nextConfirmedRequestUUID;
+        }
+
+        // new logic, new requests exist; `withdrawalQueue[0].uuid <= nextConfirmedRequestUUID` condition can be removed in next version
+        if (withdrawalQueue.length != 0 && withdrawalQueue[withdrawalQueue.length - 1].uuid >= nextConfirmedRequestUUID && withdrawalQueue[0].uuid <= nextConfirmedRequestUUID) {
             uint256 startIndex = requestIndexMap[nextConfirmedRequestUUID];
             uint256 coveredMaxIndex = binarySearchCoveredMaxIndex(undelegatedQuota);
             uint256 totalAmount = withdrawalQueue[coveredMaxIndex].totalAmount - withdrawalQueue[startIndex].totalAmount + withdrawalQueue[startIndex].amount;
