@@ -1,13 +1,13 @@
 name: Report gas diff
 
-on:
-  push:
-    branches:
-      - main
-  pull_request:
+on: [push, pull_request]
+  # push:
+    # branches:
+    # - main
+  # pull_request:
     # Optionally configure to run only for changes in specific files. For example:
     # paths:
-    # - src/**
+    # - contracts/**
     # - test/**
     # - foundry.toml
     # - remappings.txt
@@ -22,9 +22,9 @@ jobs:
           submodules: recursive
 
       - name: Install Foundry
-        uses: onbjerg/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: nightly
+          version: stable
 
       # Add any step generating a gas report to a temporary file named gasreport.ansi. For example:
       - name: Run tests
