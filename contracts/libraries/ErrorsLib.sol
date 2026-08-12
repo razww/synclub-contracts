@@ -15,4 +15,5 @@ library ErrorsLib {
     error InvalidSynFee();
     error UnclaimableRequest();
     error NotWhitelisted();
+    error AlreadySet();
 }

@@ -444,6 +444,11 @@ contract ListaStakeManagerTest is Test {
         stakeManager.setInstantWhitelist(user_A, true);
         assertTrue(stakeManager.instantWhitelist(user_A));
 
+        // no-op guard: setting the same status reverts
+        vm.prank(admin);
+        vm.expectRevert("AlreadySet()");
+        stakeManager.setInstantWhitelist(user_A, true);
+
         // admin removes user_A
         vm.prank(admin);
         stakeManager.setInstantWhitelist(user_A, false);
@@ -458,6 +463,11 @@ contract ListaStakeManagerTest is Test {
         vm.prank(user_A);
         vm.expectRevert();
         stakeManager.setInstantWhitelistOff(true);
+
+        // no-op guard: setting the already-stored status reverts
+        vm.prank(admin);
+        vm.expectRevert("AlreadySet()");
+        stakeManager.setInstantWhitelistOff(false);
 
         // admin disables the whitelist globally
         vm.prank(admin);
