@@ -111,7 +111,7 @@ contract ListaStakeManagerMainnet is Test {
 
         // cannot delegate voting power to user_A again
         vm.prank(admin);
-        vm.expectRevert("Already Delegated");
+        vm.expectRevert(ErrorsLib.AlreadySet.selector);
         stakeManager.delegateVoteTo(user_A);
 
         return usrBalance;

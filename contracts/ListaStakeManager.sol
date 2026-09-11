@@ -16,6 +16,7 @@ import {IStakeManager} from "./interfaces/IStakeManager.sol";
 import {ISLisBNB} from "./interfaces/ISLisBNB.sol";
 import {IStakeHub} from "./interfaces/IStakeHub.sol";
 import {IStakeCredit} from "./interfaces/IStakeCredit.sol";
+import {ISubStaker} from "./interfaces/ISubStaker.sol";
 
 /**
  * @title Stake Manager Contract
@@ -82,8 +83,9 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     // The operator address of the validator => true/false
     mapping(address => bool) public validators;
 
-    // Whether to delegate voting power to validator or not on delegation and re-delegation
-    bool public delegateVotePower;
+    // Deprecated variable; the vote power flag is hardcoded to false since SubStaker was introduced.
+    // Kept to preserve the storage layout; never read.
+    bool private delegateVotePowerDeprecated;
 
     // The amount Bnb received but not claimable yet
     uint256 public undelegatedQuota;
@@ -130,6 +132,13 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     // When true, bypass the instant-withdrawal whitelist (open to all); false (default) enforces it
     bool public instantWhitelistOff;
 
+    // The second delegator identity holding the ceded voting-power tranche; zero until bound
+    address public subStaker;
+
+    // Cap on the govBNB `subStaker` may hold, in wei. Its govBNB tracks the BNB it has staked,
+    // so this is simply how much of Lista's voting power is ceded, denominated in BNB.
+    uint256 public subVoteCap;
+
     struct Refund {
         uint256 dailySlisBnb; // daily slisBnb to be burned
         uint256 remainingSlisBnb; // remaining slisBnb amount to be burned
@@ -170,7 +179,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         ) revert ErrorsLib.ZeroAddress();
 
         if (_synFee > TEN_DECIMALS) revert ErrorsLib.InvalidSynFee();
-        require(_bufferSizePct <= TEN_DECIMALS, "Invalid percentage");
+        if (_bufferSizePct > TEN_DECIMALS) revert ErrorsLib.InvalidAmount();
 
         _setupRole(DEFAULT_ADMIN_ROLE, _admin);
         _setupRole(BOT, _bot);
@@ -216,7 +225,8 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         if (_amount > amountToDelegate) revert ErrorsLib.NotEnoughBnb();
 
         if (!validators[_validator]) revert ErrorsLib.InactiveValidator();
-        if (_amount < IStakeHub(STAKE_HUB).minDelegationBNBChange()) {
+        uint256 minDelegation = IStakeHub(STAKE_HUB).minDelegationBNBChange();
+        if (_amount < minDelegation) {
             revert ErrorsLib.InvalidAmount();
         }
 
@@ -229,9 +239,24 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         amountToDelegate -= _amount;
         totalDelegated += _amount;
 
-        IStakeHub(STAKE_HUB).delegate{value: _amount}(_validator, delegateVotePower);
+        // Top the SubStaker up to its cap first, then send whatever is left through this contract.
+        // Either leg is dropped when it would fall below StakeHub's minimum, and the shortfall
+        // always moves to this contract's leg so the ceded stake can never exceed the cap.
+        uint256 toSub = _subHeadroom();
+        if (toSub > _amount) toSub = _amount;
+        if (toSub != _amount && (toSub < minDelegation || _amount - toSub < minDelegation)) {
+            toSub = 0;
+        }
+        uint256 toSelf = _amount - toSub;
 
-        emit DelegateTo(_validator, _amount, delegateVotePower);
+        if (toSub != 0) {
+            IStakeHub(subStaker).delegate{value: toSub}(_validator, false);
+        }
+        if (toSelf != 0) {
+            IStakeHub(STAKE_HUB).delegate{value: toSelf}(_validator, false);
+        }
+
+        emit DelegateTo(_validator, _amount, false);
     }
 
     /**
@@ -252,7 +277,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         uint256 shares = convertBnbToShares(srcValidator, _amount);
 
         // redelegate through native staking contract
-        IStakeHub(STAKE_HUB).redelegate(srcValidator, dstValidator, shares, delegateVotePower);
+        IStakeHub(STAKE_HUB).redelegate(srcValidator, dstValidator, shares, false);
 
         emit ReDelegate(srcValidator, dstValidator, shares);
     }
@@ -348,7 +373,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     function _claimWithdrawFor(address _user, uint256 _idx) private {
         WithdrawalRequest[] storage userRequests = userWithdrawalRequests[_user];
 
-        require(_idx < userRequests.length, "Invalid index");
+        if (_idx >= userRequests.length) revert ErrorsLib.InvalidAmount();
 
         WithdrawalRequest storage withdrawRequest = userRequests[_idx];
         uint256 uuid = withdrawRequest.uuid;
@@ -395,11 +420,24 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         returns (uint256 _actualBnbAmount)
     {
         if (_amount > (getAmountToUndelegate() + reserveAmount)) revert ErrorsLib.AmountTooLarge();
-        uint256 _shares = convertBnbToShares(_operator, _amount);
-        _actualBnbAmount = convertSharesToBnb(_operator, _shares);
+
+        IStakeCredit credit = IStakeCredit(IStakeHub(STAKE_HUB).getValidatorCreditContract(_operator));
+        uint256 _shares = credit.getSharesByPooledBNB(_amount);
+        _actualBnbAmount = credit.getPooledBNBByShares(_shares);
+
+        // Draw the SubStaker's excess over its cap first, then take the rest from this contract.
+        // Undelegating has no minimum, so unlike delegateTo neither leg has to be dropped.
+        uint256 fromSub = _subExcessShares(credit);
+        if (fromSub > _shares) fromSub = _shares;
+        uint256 fromSelf = _shares - fromSub;
 
         unbondingBnb += _actualBnbAmount;
-        IStakeHub(STAKE_HUB).undelegate(_operator, _shares);
+        if (fromSub != 0) {
+            IStakeHub(subStaker).undelegate(_operator, fromSub);
+        }
+        if (fromSelf != 0) {
+            IStakeHub(STAKE_HUB).undelegate(_operator, fromSelf);
+        }
 
         emit UndelegateFrom(_operator, _actualBnbAmount, _shares);
     }
@@ -417,9 +455,19 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         onlyRole(BOT)
         returns (uint256 _uuid, uint256 _amount)
     {
+        address credit = IStakeHub(STAKE_HUB).getValidatorCreditContract(_validator);
         uint256 balanceBefore = address(this).balance;
-        IStakeHub(STAKE_HUB).claim(_validator, 0);
-        require(address(this).balance > balanceBefore, "Nothing to claim");
+
+        // Both accounts may hold matured requests on this validator; skip empty queues
+        if (IStakeCredit(credit).claimableUnbondRequest(address(this)) > 0) {
+            IStakeHub(STAKE_HUB).claim(_validator, 0);
+        }
+        address sub = subStaker;
+        if (sub != address(0) && IStakeCredit(credit).claimableUnbondRequest(sub) > 0) {
+            IStakeHub(sub).claim(_validator, 0);
+        }
+
+        if (address(this).balance <= balanceBefore) revert ErrorsLib.NotEnoughBnb();
         uint256 undelegatedAmount = address(this).balance - balanceBefore;
 
         undelegatedQuota += undelegatedAmount;
@@ -464,54 +512,10 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @param _bnbAmount - the amount of BNB used to cover withdrawal requests
      */
     function binarySearchCoveredMaxIndex(uint256 _bnbAmount) public view override returns (uint256) {
-        require(
-            withdrawalQueue.length != 0 && withdrawalQueue[0].uuid <= nextConfirmedRequestUUID,
-            "No new requests or old requests have not been fully covered"
-        );
-        if (nextConfirmedRequestUUID > withdrawalQueue[withdrawalQueue.length - 1].uuid) {
-            // all requests have been covered
-            return 0;
-        }
-        uint256 startIndex = requestIndexMap[nextConfirmedRequestUUID];
-        uint256 endIndex = withdrawalQueue.length - 1;
-        uint256 startAmount = withdrawalQueue[startIndex].amount;
-        uint256 startTotalAmount = withdrawalQueue[startIndex].totalAmount;
-
-        // covered all requests, which is the common scenario
-        if (withdrawalQueue[endIndex].totalAmount - startTotalAmount + startAmount <= _bnbAmount) {
-            return endIndex;
-        }
-
-        uint256 start = startIndex;
-        uint256 end = endIndex;
-        while (start <= end) {
-            uint256 mid = (start + end) / 2; // startIndex <= mid <= endIndex
-
-            uint256 nextAmount;
-            if (mid < endIndex) {
-                nextAmount = withdrawalQueue[mid + 1].totalAmount - startTotalAmount + startAmount;
-            } else {
-                // mid == endIndex
-                nextAmount = withdrawalQueue[endIndex].totalAmount - startTotalAmount + startAmount;
-            }
-            uint256 currentAmount = withdrawalQueue[mid].totalAmount - startTotalAmount + startAmount;
-
-            if (nextAmount > _bnbAmount && currentAmount <= _bnbAmount) {
-                return mid;
-            } else if (nextAmount <= _bnbAmount) {
-                if (mid >= endIndex) {
-                    return endIndex;
-                }
-                start = mid + 1;
-            } else {
-                if (mid <= startIndex) {
-                    return startIndex;
-                }
-                end = mid - 1;
-            }
-        }
-
-        return startIndex;
+        return
+            SLisLibrary.binarySearchCoveredMaxIndex(
+                withdrawalQueue, requestIndexMap, nextConfirmedRequestUUID, _bnbAmount
+            );
     }
 
     /**
@@ -524,21 +528,12 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         IVotesUpgradeable govToken = IVotesUpgradeable(GOV_BNB);
 
         address currentDelegatee = govToken.delegates(address(this));
-        require(currentDelegatee != _delegateTo, "Already Delegated");
+        if (currentDelegatee == _delegateTo) revert ErrorsLib.AlreadySet();
 
+        // ERC20Votes moves the delegator's entire balance to the new delegatee; the previous
+        // post-hoc assertions only re-checked that guarantee and are covered by fork tests instead
         uint256 balance = IERC20Upgradeable(GOV_BNB).balanceOf(address(this));
-
-        uint256 newVotePower = govToken.getVotes(_delegateTo);
-        uint256 currentVotePower = govToken.getVotes(currentDelegatee);
         govToken.delegate(_delegateTo);
-
-        // Check voting power moved correctly
-        if (_delegateTo != address(this)) {
-            uint256 currDelegateeChange = currentVotePower - govToken.getVotes(currentDelegatee);
-            uint256 newDelegateeChange = govToken.getVotes(_delegateTo) - newVotePower;
-
-            require(currDelegateeChange == newDelegateeChange && balance == currDelegateeChange, "Invalid Change");
-        }
 
         emit DelegateVoteTo(_delegateTo, balance);
     }
@@ -589,6 +584,42 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     function setReserveAmount(uint256 amount) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         reserveAmount = amount;
         emit SetReserveAmount(amount);
+    }
+
+    /// @dev Matured, claimable BNB of `_account` on `_credit`
+    function _claimableOf(address _credit, address _account) private view returns (uint256 _amount) {
+        uint256 count = IStakeCredit(_credit).claimableUnbondRequest(_account);
+        for (uint256 i = 0; i < count; ++i) {
+            _amount += IStakeCredit(_credit).unbondRequest(_account, i).bnbAmount;
+        }
+    }
+
+    /// @dev How much more govBNB the SubStaker may still hold; zero once it is unbound or full
+    function _subHeadroom() private view returns (uint256) {
+        address sub = subStaker;
+        if (sub == address(0)) return 0;
+
+        uint256 held = IERC20Upgradeable(GOV_BNB).balanceOf(sub);
+        return held < subVoteCap ? subVoteCap - held : 0;
+    }
+
+    /**
+     * @dev The SubStaker's shares on `_credit` that sit above its cap, capped by what it actually
+     *      holds there. Zero while it is unbound or within the cap. Paired with `_subHeadroom`
+     *      this points the other way, so deposit and withdrawal flow walks the split toward the
+     *      cap without a dedicated rebalancing transaction.
+     */
+    function _subExcessShares(IStakeCredit _credit) private view returns (uint256) {
+        address sub = subStaker;
+        if (sub == address(0)) return 0;
+
+        uint256 held = IERC20Upgradeable(GOV_BNB).balanceOf(sub);
+        if (held <= subVoteCap) return 0;
+
+        uint256 excess = _credit.getSharesByPooledBNB(held - subVoteCap);
+        uint256 balance = _credit.balanceOf(sub);
+
+        return excess > balance ? balance : excess;
     }
 
     /**
@@ -684,8 +715,8 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      */
     function removeValidator(address _address) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_address == address(0)) revert ErrorsLib.InvalidAddress();
-        require(!validators[_address], "Validator should be inactive");
-        require(getDelegated(_address) == 0, "Balance is not zero");
+        if (validators[_address]) revert ErrorsLib.InactiveValidator();
+        if (getDelegated(_address) != 0) revert ErrorsLib.AmountTooLarge();
 
         syncCredits(_address, true);
         delete validators[_address];
@@ -698,7 +729,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @param newPct - New buffer size percentage; should be less than or equal to 1e10
      */
     function setBufferSizePct(uint256 newPct) external override onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(newPct <= TEN_DECIMALS, "Invalid percentage");
+        if (newPct > TEN_DECIMALS) revert ErrorsLib.InvalidAmount();
 
         bufferSizePct = newPct;
         emit SetBufferSizePct(newPct);
@@ -709,7 +740,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @param _instantWithdrawFeeRate - New instant withdraw fee rate; should be less than or equal to 1e10
      */
     function setInstantWithdrawFeeRate(uint256 _instantWithdrawFeeRate) external override onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_instantWithdrawFeeRate <= TEN_DECIMALS, "Invalid percentage");
+        if (_instantWithdrawFeeRate > TEN_DECIMALS) revert ErrorsLib.InvalidAmount();
         instantWithdrawFeeRate = _instantWithdrawFeeRate;
 
         emit SetInstantWithdrawFeeRate(_instantWithdrawFeeRate);
@@ -736,6 +767,25 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         if (instantWhitelistOff == _off) revert ErrorsLib.AlreadySet();
         instantWhitelistOff = _off;
         emit SetInstantWhitelistOff(_off);
+    }
+
+    /**
+     * @dev Binds the SubStaker and sets how much voting power may sit with it
+     * @param _subStaker - Address of the SubStaker proxy
+     * @param _cap - Cap on the SubStaker's govBNB, in wei
+     * @notice Address and cap move together so the ceded tranche is always configured as one
+     *         decision. Lowering the cap moves nothing by itself; withdrawals unwind the excess.
+     * @notice Rejects anything that does not point back at this contract, so a mistyped address
+     *         cannot be handed pool funds. The binding stays re-settable.
+     */
+    function setSubStaker(address _subStaker, uint256 _cap) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_subStaker == address(0)) revert ErrorsLib.ZeroAddress();
+        if (ISubStaker(_subStaker).stakeManager() != address(this)) revert ErrorsLib.InvalidAddress();
+
+        subStaker = _subStaker;
+        subVoteCap = _cap;
+
+        emit SetSubStaker(_subStaker, _cap);
     }
 
     function getTotalPooledBnb() public view override returns (uint256) {
@@ -775,7 +825,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     {
         WithdrawalRequest[] storage userRequests = userWithdrawalRequests[_user];
 
-        require(_idx < userRequests.length, "Invalid index");
+        if (_idx >= userRequests.length) revert ErrorsLib.InvalidAmount();
 
         WithdrawalRequest storage withdrawRequest = userRequests[_idx];
         uint256 uuid = withdrawRequest.uuid;
@@ -814,9 +864,11 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @return the total amount of BNB staked and reward
      */
     function getDelegated(address _validator) public view override returns (uint256) {
-        address creditContract = IStakeHub(STAKE_HUB).getValidatorCreditContract(_validator);
-        return IStakeCredit(creditContract).getPooledBNB(address(this))
-            + IStakeCredit(creditContract).lockedBNBs(address(this), 0);
+        IStakeCredit credit = IStakeCredit(IStakeHub(STAKE_HUB).getValidatorCreditContract(_validator));
+        address sub = subStaker;
+
+        return credit.getPooledBNB(address(this)) + credit.lockedBNBs(address(this), 0)
+            + (sub == address(0) ? 0 : credit.getPooledBNB(sub) + credit.lockedBNBs(sub, 0));
     }
 
     /**
@@ -845,14 +897,11 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      */
     function getClaimableAmount(address _validator) public view override returns (uint256 _amount) {
         address creditContract = IStakeHub(STAKE_HUB).getValidatorCreditContract(_validator);
-        uint256 count = IStakeCredit(creditContract).claimableUnbondRequest(address(this));
-        uint256 index = 0;
+        _amount = _claimableOf(creditContract, address(this));
 
-        while (count != 0) {
-            IStakeCredit.UnbondRequest memory req = IStakeCredit(creditContract).unbondRequest(address(this), index);
-            _amount += req.bnbAmount;
-            --count;
-            ++index;
+        address sub = subStaker;
+        if (sub != address(0)) {
+            _amount += _claimableOf(creditContract, sub);
         }
     }
 
@@ -935,13 +984,6 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         _pause();
     }
 
-    /**
-     * @dev Flips the vote power flag
-     */
-    function toggleVote() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        delegateVotePower = !delegateVotePower;
-    }
-
     receive() external payable {}
 
     /**
@@ -989,7 +1031,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @param _days - Number of days to split the refund
      */
     function refundCommission(uint256 _days) external payable override whenNotPaused onlyRole(MANAGER) {
-        require(msg.value > 0 && _days > 0, "Invalid Amount or Days");
+        if (msg.value == 0 || _days == 0) revert ErrorsLib.InvalidAmount();
 
         uint256 refundSlisBnb = convertBnbToSnBnb(msg.value);
         uint256 slisBnbAmount = refundSlisBnb + refund.remainingSlisBnb;
@@ -1008,10 +1050,14 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     /// @dev Returns the total amount of BNB in all validators
     function getTotalBnbInValidators() public view override returns (uint256) {
         uint256 totalBnb = 0;
+        address sub = subStaker;
         for (uint256 i = 0; i < creditContracts.length; i++) {
             IStakeCredit credit = IStakeCredit(creditContracts[i]);
             if (creditStates[address(credit)]) {
                 totalBnb += credit.getPooledBNB(address(this)) + credit.lockedBNBs(address(this), 0);
+                if (sub != address(0)) {
+                    totalBnb += credit.getPooledBNB(sub) + credit.lockedBNBs(sub, 0);
+                }
             }
         }
         return totalBnb;

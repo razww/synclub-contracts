@@ -6,6 +6,7 @@ import "forge-std/console.sol";
 import "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 import "../../contracts/ListaStakeManager.sol";
+import {ErrorsLib} from "../../contracts/libraries/ErrorsLib.sol";
 import "../../contracts/SLisBNB.sol";
 import "../../contracts/mock/MockClaim.sol";
 
@@ -178,7 +179,7 @@ contract ListaStakeManagerTest is Test {
         vm.stopPrank();
 
         vm.startPrank(admin);
-        vm.expectRevert("Validator should be inactive");
+        vm.expectRevert(ErrorsLib.InactiveValidator.selector);
         stakeManager.removeValidator(validator_A);
 
         stakeManager.disableValidator(validator_A);
@@ -305,6 +306,9 @@ contract ListaStakeManagerTest is Test {
         );
         vm.mockCall(
             credit_A, abi.encodeWithSignature("getPooledBNBByShares(uint256)", 3e18), abi.encode(3000000000000000000)
+        );
+        vm.mockCall(
+            credit_A, abi.encodeWithSignature("claimableUnbondRequest(address)", address(stakeManager)), abi.encode(1)
         );
 
         vm.prank(admin);
