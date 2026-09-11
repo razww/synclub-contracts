@@ -91,4 +91,30 @@ library SLisLibrary {
 
         return startIndex;
     }
+
+    /**
+     * @dev BNB the bot still has to undelegate to cover the pending withdrawal queue
+     * @notice Lives here rather than in ListaStakeManager purely for bytecode budget; the manager
+     *         keeps the selector and forwards.
+     */
+    function amountToUndelegate(
+        IStakeManager.UserRequest[] storage withdrawalQueue,
+        mapping(uint256 => uint256) storage requestIndexMap,
+        uint256 nextConfirmedRequestUUID,
+        uint256 unbondingBnb,
+        uint256 undelegatedQuota
+    ) public view returns (uint256 _amountToUndelegate) {
+        if (withdrawalQueue.length == 0 || withdrawalQueue[withdrawalQueue.length - 1].uuid < nextConfirmedRequestUUID)
+        {
+            return 0;
+        }
+
+        uint256 nextIndex = requestIndexMap[nextConfirmedRequestUUID];
+        uint256 totalAmountToWithdraw = withdrawalQueue[withdrawalQueue.length - 1].totalAmount
+            - withdrawalQueue[nextIndex].totalAmount + withdrawalQueue[nextIndex].amount;
+
+        _amountToUndelegate = totalAmountToWithdraw > unbondingBnb ? totalAmountToWithdraw - unbondingBnb : 0;
+
+        return _amountToUndelegate >= undelegatedQuota ? _amountToUndelegate - undelegatedQuota : 0;
+    }
 }

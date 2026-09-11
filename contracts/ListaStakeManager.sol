@@ -425,11 +425,8 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         uint256 _shares = credit.getSharesByPooledBNB(_amount);
         _actualBnbAmount = credit.getPooledBNBByShares(_shares);
 
-        // Draw the SubStaker's excess over its cap first, then take the rest from this contract.
-        // Undelegating has no minimum, so unlike delegateTo neither leg has to be dropped.
-        uint256 fromSub = _subExcessShares(credit);
-        if (fromSub > _shares) fromSub = _shares;
-        uint256 fromSelf = _shares - fromSub;
+        // Undelegating has no minimum, so unlike delegateTo neither leg has to be dropped
+        (uint256 fromSub, uint256 fromSelf) = _splitUndelegation(credit, _shares);
 
         unbondingBnb += _actualBnbAmount;
         if (fromSub != 0) {
@@ -604,22 +601,42 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
     }
 
     /**
-     * @dev The SubStaker's shares on `_credit` that sit above its cap, capped by what it actually
-     *      holds there. Zero while it is unbound or within the cap. Paired with `_subHeadroom`
-     *      this points the other way, so deposit and withdrawal flow walks the split toward the
-     *      cap without a dedicated rebalancing transaction.
+     * @dev Splits shares leaving `_credit` between this contract and the SubStaker
+     * @param _credit - StakeCredit being unwound
+     * @param _shares - Total shares to undelegate
+     * @return _fromSub - Shares to take from the SubStaker
+     * @return _fromSelf - Shares to take from this contract
+     * @notice The cap only sets a preference - drain whatever sits above it first, which pairs
+     *         with `_subHeadroom` to walk the split back toward the cap. It must never block a
+     *         redemption, so anything this contract cannot cover on this validator comes out of
+     *         the SubStaker regardless of the cap. Reverts only when the two together are short.
      */
-    function _subExcessShares(IStakeCredit _credit) private view returns (uint256) {
+    function _splitUndelegation(IStakeCredit _credit, uint256 _shares)
+        private
+        view
+        returns (uint256 _fromSub, uint256 _fromSelf)
+    {
         address sub = subStaker;
-        if (sub == address(0)) return 0;
+        uint256 subBalance = sub == address(0) ? 0 : _credit.balanceOf(sub);
 
-        uint256 held = IERC20Upgradeable(GOV_BNB).balanceOf(sub);
-        if (held <= subVoteCap) return 0;
+        if (subBalance != 0) {
+            uint256 held = IERC20Upgradeable(GOV_BNB).balanceOf(sub);
+            if (held > subVoteCap) {
+                _fromSub = _credit.getSharesByPooledBNB(held - subVoteCap);
+                if (_fromSub > subBalance) _fromSub = subBalance;
+                if (_fromSub > _shares) _fromSub = _shares;
+            }
+        }
 
-        uint256 excess = _credit.getSharesByPooledBNB(held - subVoteCap);
-        uint256 balance = _credit.balanceOf(sub);
+        _fromSelf = _shares - _fromSub;
 
-        return excess > balance ? balance : excess;
+        uint256 selfBalance = _credit.balanceOf(address(this));
+        if (_fromSelf > selfBalance) {
+            _fromSub += _fromSelf - selfBalance;
+            _fromSelf = selfBalance;
+
+            if (_fromSub > subBalance) revert ErrorsLib.AmountTooLarge();
+        }
     }
 
     /**
@@ -875,19 +892,10 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @dev Bot use this method to get the amount of BNB to call undelegateFrom
      * @return _amountToUndelegate Bnb amount to be undelegated by bot
      */
-    function getAmountToUndelegate() public view override returns (uint256 _amountToUndelegate) {
-        if (withdrawalQueue.length == 0 || withdrawalQueue[withdrawalQueue.length - 1].uuid < nextConfirmedRequestUUID)
-        {
-            return 0;
-        }
-
-        uint256 nextIndex = requestIndexMap[nextConfirmedRequestUUID];
-        uint256 totalAmountToWithdraw = withdrawalQueue[withdrawalQueue.length - 1].totalAmount
-            - withdrawalQueue[nextIndex].totalAmount + withdrawalQueue[nextIndex].amount;
-
-        _amountToUndelegate = totalAmountToWithdraw > unbondingBnb ? totalAmountToWithdraw - unbondingBnb : 0;
-
-        return _amountToUndelegate >= undelegatedQuota ? _amountToUndelegate - undelegatedQuota : 0;
+    function getAmountToUndelegate() public view override returns (uint256) {
+        return SLisLibrary.amountToUndelegate(
+            withdrawalQueue, requestIndexMap, nextConfirmedRequestUUID, unbondingBnb, undelegatedQuota
+        );
     }
 
     /**

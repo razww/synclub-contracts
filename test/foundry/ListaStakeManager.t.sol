@@ -9,6 +9,8 @@ import "../../contracts/ListaStakeManager.sol";
 import {ErrorsLib} from "../../contracts/libraries/ErrorsLib.sol";
 import "../../contracts/SLisBNB.sol";
 import "../../contracts/mock/MockClaim.sol";
+import "../../contracts/SubStaker.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {IStakeManager} from "../../contracts/interfaces/IStakeManager.sol";
 
@@ -255,6 +257,12 @@ contract ListaStakeManagerTest is Test {
         vm.mockCall(
             credit_A, abi.encodeWithSignature("getPooledBNBByShares(uint256)", 1e18), abi.encode(1000000000000000000)
         );
+        // the manager holds every share on this credit; SubStaker is unbound in these tests
+        vm.mockCall(
+            credit_A,
+            abi.encodeWithSignature("balanceOf(address)", address(stakeManager)),
+            abi.encode(type(uint256).max)
+        );
 
         vm.prank(admin);
         stakeManager.whitelistValidator(validator_A);
@@ -306,6 +314,12 @@ contract ListaStakeManagerTest is Test {
         );
         vm.mockCall(
             credit_A, abi.encodeWithSignature("getPooledBNBByShares(uint256)", 3e18), abi.encode(3000000000000000000)
+        );
+        // the manager holds every share on this credit; SubStaker is unbound in these tests
+        vm.mockCall(
+            credit_A,
+            abi.encodeWithSignature("balanceOf(address)", address(stakeManager)),
+            abi.encode(type(uint256).max)
         );
         vm.mockCall(
             credit_A, abi.encodeWithSignature("claimableUnbondRequest(address)", address(stakeManager)), abi.encode(1)
@@ -495,6 +509,12 @@ contract ListaStakeManagerTest is Test {
         vm.mockCall(
             credit_A, abi.encodeWithSignature("getPooledBNBByShares(uint256)", 3e18), abi.encode(3000000000000000000)
         );
+        // the manager holds every share on this credit; SubStaker is unbound in these tests
+        vm.mockCall(
+            credit_A,
+            abi.encodeWithSignature("balanceOf(address)", address(stakeManager)),
+            abi.encode(type(uint256).max)
+        );
 
         // initialize the stakeManager with total pooled BNB of 1000 Bnb
         vm.prank(admin);
@@ -608,5 +628,60 @@ contract ListaStakeManagerTest is Test {
         vm.prank(user_A);
         (success,) = address(stakeManager).call{value: 10 ether, gas: 2300}("");
         assertTrue(success);
+    }
+
+    address private constant GOV_BNB = 0x0000000000000000000000000000000000002005;
+
+    /// Deploys a SubStaker behind a proxy and binds it with `cap`
+    function _bindSubStaker(uint256 cap) private returns (SubStaker sub) {
+        SubStaker impl = new SubStaker();
+        sub = SubStaker(
+            payable(new ERC1967Proxy(
+                    address(impl), abi.encodeWithSelector(SubStaker.initialize.selector, address(stakeManager))
+                ))
+        );
+
+        vm.prank(admin);
+        stakeManager.setSubStaker(address(sub), cap);
+    }
+
+    /// A cap that the SubStaker is exactly at must not stop a user from redeeming. Regression for
+    /// treating the cap as a floor on the SubStaker's position rather than a routing preference.
+    function test_undelegateFrom_capDoesNotBlockWithdrawal() public {
+        vm.mockCall(
+            STAKE_HUB, abi.encodeWithSignature("getValidatorCreditContract(address)", validator_A), abi.encode(credit_A)
+        );
+        vm.mockCall(
+            credit_A, abi.encodeWithSignature("getSharesByPooledBNB(uint256)", 10e18), abi.encode(uint256(10e18))
+        );
+        vm.mockCall(
+            credit_A, abi.encodeWithSignature("getPooledBNBByShares(uint256)", 10e18), abi.encode(uint256(10e18))
+        );
+
+        SubStaker sub = _bindSubStaker(100 ether);
+
+        // the undelegation allowance is orthogonal to this regression; open it directly
+        vm.prank(admin);
+        stakeManager.setReserveAmount(10 ether);
+
+        // The whole position sits with the SubStaker, exactly at its cap, so there is no excess
+        vm.mockCall(credit_A, abi.encodeWithSignature("balanceOf(address)", address(sub)), abi.encode(uint256(100e18)));
+        vm.mockCall(
+            credit_A, abi.encodeWithSignature("balanceOf(address)", address(stakeManager)), abi.encode(uint256(0))
+        );
+        vm.mockCall(GOV_BNB, abi.encodeWithSignature("balanceOf(address)", address(sub)), abi.encode(uint256(100e18)));
+
+        // Only the SubStaker may be asked to undelegate; a call from the manager would mean the
+        // cap had been treated as untouchable and the redemption would have reverted
+        vm.mockCall(
+            address(sub), abi.encodeWithSignature("undelegate(address,uint256)", validator_A, 10e18), abi.encode()
+        );
+        vm.expectCall(address(sub), abi.encodeWithSignature("undelegate(address,uint256)", validator_A, 10e18));
+
+        vm.prank(bot);
+        uint256 actual = stakeManager.undelegateFrom(validator_A, 10 ether);
+
+        assertEq(actual, 10 ether);
+        assertEq(stakeManager.unbondingBnb(), 10 ether);
     }
 }
