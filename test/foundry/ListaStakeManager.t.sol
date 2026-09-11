@@ -684,4 +684,35 @@ contract ListaStakeManagerTest is Test {
         assertEq(actual, 10 ether);
         assertEq(stakeManager.unbondingBnb(), 10 ether);
     }
+
+    /// Both govBNB buckets must be steerable: the manager's own, and the SubStaker's
+    function test_bothVoteDelegateesCanBeChanged() public {
+        address listaVoter = makeAddr("listaVoter");
+        address club48 = makeAddr("club48");
+
+        SubStaker sub = _bindSubStaker(100 ether);
+
+        vm.mockCall(GOV_BNB, abi.encodeWithSignature("delegates(address)"), abi.encode(address(0)));
+        vm.mockCall(GOV_BNB, abi.encodeWithSignature("balanceOf(address)"), abi.encode(uint256(0)));
+        vm.mockCall(GOV_BNB, abi.encodeWithSignature("delegate(address)"), abi.encode());
+
+        // the manager's own tranche
+        vm.expectCall(GOV_BNB, abi.encodeWithSignature("delegate(address)", listaVoter));
+        vm.prank(admin);
+        stakeManager.delegateVoteTo(listaVoter);
+
+        // the SubStaker's tranche, set by the same admin role, straight on the SubStaker
+        vm.expectCall(GOV_BNB, abi.encodeWithSignature("delegate(address)", club48));
+        vm.prank(admin);
+        sub.setVoteDelegatee(club48);
+
+        // and neither is reachable without that role
+        vm.prank(bot);
+        vm.expectRevert();
+        stakeManager.delegateVoteTo(listaVoter);
+
+        vm.prank(bot);
+        vm.expectRevert(SubStaker.NotAdmin.selector);
+        sub.setVoteDelegatee(club48);
+    }
 }
