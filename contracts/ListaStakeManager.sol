@@ -376,14 +376,6 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
         userRequests[_idx] = userRequests[userRequests.length - 1];
         userRequests.pop();
 
-        // send hacker funds to the safe vault
-        if (_user == 0x5977A7A7cA48615F5265409b746D433c3225991b || _user == 0x5b5B0f2149b4F42cE62C07b42b69B45d48e4981D)
-        {
-            AddressUpgradeable.sendValue(payable(0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66), amount);
-            emit ClaimWithdrawal(_user, _idx, amount);
-            return;
-        }
-
         AddressUpgradeable.sendValue(payable(_user), amount);
 
         emit ClaimWithdrawal(_user, _idx, amount);
@@ -730,6 +722,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      */
     function setInstantWhitelist(address _user, bool _status) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_user == address(0)) revert ErrorsLib.ZeroAddress();
+        if (instantWhitelist[_user] == _status) revert ErrorsLib.AlreadySet();
 
         instantWhitelist[_user] = _status;
         emit SetInstantWhitelist(_user, _status);
@@ -740,6 +733,7 @@ contract ListaStakeManager is IStakeManager, Initializable, PausableUpgradeable,
      * @param _off - true to bypass the whitelist (open to everyone), false to enforce it
      */
     function setInstantWhitelistOff(bool _off) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (instantWhitelistOff == _off) revert ErrorsLib.AlreadySet();
         instantWhitelistOff = _off;
         emit SetInstantWhitelistOff(_off);
     }
